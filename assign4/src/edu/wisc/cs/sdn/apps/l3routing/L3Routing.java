@@ -5,13 +5,20 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
 
+import org.openflow.protocol.OFMatch;
+import org.openflow.protocol.action.OFAction;
+import org.openflow.protocol.action.OFActionOutput;
+import org.openflow.protocol.instruction.OFInstruction;
+import org.openflow.protocol.instruction.OFInstructionApplyActions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import edu.wisc.cs.sdn.apps.util.Host;
-
+import edu.wisc.cs.sdn.apps.util.SwitchCommands;
 import net.floodlightcontroller.core.IFloodlightProviderService;
 import net.floodlightcontroller.core.IOFSwitch;
 import net.floodlightcontroller.core.IOFSwitch.PortChangeType;
@@ -50,6 +57,7 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
     
     // Map of hosts to devices
     private Map<IDevice,Host> knownHosts;
+    
 
 	/**
      * Loads dependencies and initializes data structures.
@@ -84,7 +92,6 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 		
 		/*********************************************************************/
 		/* TODO: Initialize variables or perform startup tasks, if necessary */
-		
 		/*********************************************************************/
 	}
 	
@@ -116,16 +123,16 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 	{
 		Host host = new Host(device, this.floodlightProv);
 		// We only care about a new host if we know its IP
-		if (host.getIPv4Address() != null)
-		{
-			log.info(String.format("Host %s added", host.getName()));
-			this.knownHosts.put(device, host);
-			
-			/*****************************************************************/
-			/* TODO: Update routing: add rules to route to new host          */
-			
-			/*****************************************************************/
-		}
+		if (host.getIPv4Address() == null)
+			return;
+		
+		log.info(String.format("Host %s added", host.getName()));
+		this.knownHosts.put(device, host);
+		
+		/*****************************************************************/
+		/* TODO: Update routing: add rules to route to new host          */
+		this.installRulesToHost(host);
+		/*****************************************************************/
 	}
 
 	/**
@@ -137,7 +144,7 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 	{
 		Host host = this.knownHosts.get(device);
 		if (null == host)
-		{ return; }
+			return;
 		this.knownHosts.remove(device);
 		
 		log.info(String.format("Host %s is no longer attached to a switch", 
@@ -145,7 +152,7 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 		
 		/*********************************************************************/
 		/* TODO: Update routing: remove rules to route to host               */
-		
+		this.removeRulesFromHost(host);
 		/*********************************************************************/
 	}
 
@@ -173,7 +180,8 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 		
 		/*********************************************************************/
 		/* TODO: Update routing: change rules to route to host               */
-		
+		this.removeRulesFromHost(host);
+		this.installRulesToHost(host);
 		/*********************************************************************/
 	}
 	
@@ -189,7 +197,11 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 		
 		/*********************************************************************/
 		/* TODO: Update routing: change routing rules for all hosts          */
-		
+		for (Host host : this.getHosts())
+		{
+			this.removeRulesFromHost(host);
+			this.installRulesToHost(host);
+		}
 		/*********************************************************************/
 	}
 
@@ -205,7 +217,11 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 		
 		/*********************************************************************/
 		/* TODO: Update routing: change routing rules for all hosts          */
-		
+		for (Host host : this.getHosts())
+		{
+			this.removeRulesFromHost(host);
+			this.installRulesToHost(host);
+		}
 		/*********************************************************************/
 	}
 
@@ -240,6 +256,132 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 		/*********************************************************************/
 	}
 
+	/**
+	 * Executes Bellman-Ford algorithm on current switch network.
+	 *  
+	 * @param start Switch from which to execute 
+	 * @return Switch DPID -> Distance from given switch
+	 */
+	private Map<Long, Integer> runBellmanFordAlgorithm(IOFSwitch start)
+	{
+		Map<Long, Integer> bestRouteDistMap = new ConcurrentHashMap<>();
+		Map<Long, Integer> bestRoutePorts = new ConcurrentHashMap<>();
+		Queue<Long> swToProcess = new LinkedBlockingQueue<>();
+		
+		// init graph to infinity (-1) in this case
+		for (Map.Entry<Long, IOFSwitch> pair : this.getSwitches().entrySet())
+			bestRouteDistMap.put(pair.getKey(), -1);
+		
+		// current switch has weight of zero
+		bestRouteDistMap.put(start.getId(), 0);
+		
+		// main iteration //
+		swToProcess.add(start.getId());
+		while (!swToProcess.isEmpty())
+		{
+			long sw_id = swToProcess.remove();
+			
+			// get all links connected to the switch //
+			List<Link> sw_links = new ArrayList<Link>();
+			for (Link l : this.getUniqueLinks())
+				if (l.getSrc() == sw_id || l.getDst() == sw_id)
+					sw_links.add(l);
+			
+			// loop over connected links //
+			for (Link link : sw_links)
+			{
+				// is the switch at the link src or dest?
+				// have to check since links are bidirectional
+				boolean is_src = (sw_id == link.getSrc());
+				
+				// the other switch ID
+				long other_sw = (is_src) ? link.getDst() : link.getSrc();
+				
+				// current distance to the switch with id "sw_id"
+				int distToSwitch = bestRouteDistMap.get(sw_id);
+				
+				// current distance to the swithc with id "other_sw"
+				int currDistToOtherSwitch = (is_src) ? bestRouteDistMap.get(link.getSrc()) 
+						: bestRouteDistMap.get(link.getDst());
+				
+				// what's the distance to the sw right next to us?
+				// if the current distance is bigger than ours + 1, then
+				// we have a better path. 
+				if (currDistToOtherSwitch > distToSwitch + 1)
+				{
+					bestRouteDistMap.put(other_sw, distToSwitch + 1);
+					bestRoutePorts.put(other_sw, (is_src) ? link.getDstPort() : link.getSrcPort()); 
+				}
+				
+				// in any case, we need to process this new switch
+				swToProcess.add(other_sw);
+			}
+		}
+		
+		// in order to install the routes, we need to know the map between
+		// DPID and ports. So we return this map.
+		return bestRoutePorts;
+	}
+	
+	private List<Link> getUniqueLinks()
+	{
+		List<Link> unique_links = new ArrayList<Link>();
+		for (Link l : this.getLinks())
+		{
+			for (Link ul : unique_links)
+			{
+				boolean same_dir_match = (l.getDst() == ul.getDst()) && (l.getSrc() == ul.getSrc());
+				boolean opp_dir_match = (l.getDst() == ul.getSrc()) && (l.getSrc() == ul.getDst());
+				
+				if (same_dir_match || opp_dir_match)
+					break;
+			}
+			
+			unique_links.add(l);
+		}
+		
+		return unique_links;
+	}
+	
+	private void installRulesToHost(Host host)
+	{
+		if (!host.isAttachedToSwitch())
+			return;
+		
+		Map<Long, Integer> bestRoute = this.runBellmanFordAlgorithm(host.getSwitch());
+		for (long sw_id : bestRoute.keySet())
+		{
+			OFAction action = new OFActionOutput(bestRoute.get(sw_id));
+			OFInstruction instr = new OFInstructionApplyActions(Arrays.asList(action));
+
+			
+			boolean success = SwitchCommands.installRule(
+				this.getSwitches().get(sw_id), 
+				table,
+				SwitchCommands.DEFAULT_PRIORITY,
+				this.getMatchCriterion(host),
+				Arrays.asList(instr)
+			);
+			
+			System.out.println(success + " installing rule on switch: " 
+					+ this.getSwitches().get(sw_id) + " | ID: " + sw_id);
+		}
+	}
+	
+	private void removeRulesFromHost(Host host)
+	{
+		for (IOFSwitch sw : this.getSwitches().values())
+			SwitchCommands.removeRules(sw, table, getMatchCriterion(host));
+	}
+	
+	private OFMatch getMatchCriterion(Host host)
+	{
+		OFMatch match = new OFMatch();
+		match.setDataLayerType(OFMatch.ETH_TYPE_IPV4);
+		match.setNetworkDestination(host.getIPv4Address());
+		return match;
+	}
+	
 	/**
 	 * Event handler called when link goes up or down.
 	 * @param update information about the change in link state
