@@ -273,57 +273,71 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 		Map<Long, Integer> bestRouteDistMap = new ConcurrentHashMap<Long, Integer>();
 		Map<Long, Integer> bestRoutePorts = new ConcurrentHashMap<Long, Integer>();
 		Queue<Long> swToProcess = new LinkedBlockingQueue<Long>();
-		
-		// init graph to infinity (-1) in this case
+	
+		// init graph distances to infinity 
 		for (Map.Entry<Long, IOFSwitch> pair : this.getSwitches().entrySet())
 			bestRouteDistMap.put(pair.getKey(), -1);
 		
 		// current switch has weight of zero
 		bestRouteDistMap.put(start.getId(), 0);
 		
+        System.out.println("Bellman Ford Algorithm");
 		// main iteration //
-		swToProcess.add(start.getId());
+	    List<Long> seenBefore = new ArrayList<Long>();
+        swToProcess.add(start.getId());
 		while (!swToProcess.isEmpty())
 		{
 			long sw_id = swToProcess.remove();
-			
+            System.out.println("Processing ID: " + sw_id);
+	
 			// get all links connected to the switch //
-			List<Link> sw_links = new ArrayList<Link>();
+			Queue<Link> sw_links = new LinkedBlockingQueue<Link>();
 			for (Link l : this.getUniqueLinks())
 				if (l.getSrc() == sw_id || l.getDst() == sw_id)
 					sw_links.add(l);
 			
 			// loop over connected links //
-			for (Link link : sw_links)
-			{
+            while (!sw_links.isEmpty())
+            {
+                Link link = sw_links.remove();
+
 				// is the switch at the link src or dest?
 				// have to check since links are bidirectional
 				boolean is_src = (sw_id == link.getSrc());
 				
 				// the other switch ID
 				long other_sw = (is_src) ? link.getDst() : link.getSrc();
-				
+                System.out.println("The other_sw: " + other_sw);
+
 				// current distance to the switch with id "sw_id"
 				int distToSwitch = bestRouteDistMap.get(sw_id);
 				
 				// current distance to the swithc with id "other_sw"
-				int currDistToOtherSwitch = (is_src) ? bestRouteDistMap.get(link.getSrc()) 
-						: bestRouteDistMap.get(link.getDst());
-				
+				int currDistToOtherSwitch = (is_src) ? bestRouteDistMap.get(link.getDst()) 
+						: bestRouteDistMap.get(link.getSrc());
+			
+
+                System.out.println("DistToSwitch: " + distToSwitch + " | DistToOther: " + currDistToOtherSwitch);
+	
 				// what's the distance to the sw right next to us?
 				// if the current distance is bigger than ours + 1, then
-				// we have a better path. 
+				// we have a better path.
 				if (currDistToOtherSwitch < 0 || currDistToOtherSwitch > distToSwitch + 1)
 				{
+                    System.out.println("Setting: " + other_sw + " | V: " + distToSwitch + 1);
 					bestRouteDistMap.put(other_sw, distToSwitch + 1);
 					bestRoutePorts.put(other_sw, (is_src) ? link.getDstPort() : link.getSrcPort()); 
 				}
-				
-				// in any case, we need to process this new switch
-				swToProcess.add(other_sw);
-			}
+			
+                seenBefore.add(sw_id);
+				// in any case, we need to process this new switch if it's new
+                if (!seenBefore.contains(other_sw))
+                    swToProcess.add(other_sw);
+
+            }
 		}
-        System.out.println("Bellman Ford Algorithm");
+
+
         for (Map.Entry<Long, Integer> e : bestRouteDistMap.entrySet())
         {
             System.out.println("ID: " + e.getKey() + " | V: " + e.getValue());
@@ -339,16 +353,20 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 		List<Link> unique_links = new ArrayList<Link>();
 		for (Link l : this.getLinks())
 		{
+            boolean found = false;
 			for (Link ul : unique_links)
 			{
 				boolean same_dir_match = (l.getDst() == ul.getDst()) && (l.getSrc() == ul.getSrc());
 				boolean opp_dir_match = (l.getDst() == ul.getSrc()) && (l.getSrc() == ul.getDst());
 				
 				if (same_dir_match || opp_dir_match)
-					break;
+			    {
+                    found = true;
+                    break;
+                }
 			}
-			
-			unique_links.add(l);
+			if (!found)
+			    unique_links.add(l);
 		}
 		
 		return unique_links;
@@ -357,15 +375,19 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 	private void installRulesToHost(Host host)
 	{
 		if (!host.isAttachedToSwitch())
+        {
+            System.out.println("Attempted to install rules to host, not connected to switch.");
 			return;
-		
+		}
+
 		Map<Long, Integer> bestRoute = this.runBellmanFordAlgorithm(host.getSwitch());
+/*
         System.out.println("Install rules: ");
         for (Map.Entry<Long, Integer> e : bestRoute.entrySet())
         {
             System.out.println("ID: " + e.getKey() + " | V: " + e.getValue());
         }
-
+*/
 		for (long sw_id : bestRoute.keySet())
 		{
             if (this.getSwitches().get(sw_id) == null)
