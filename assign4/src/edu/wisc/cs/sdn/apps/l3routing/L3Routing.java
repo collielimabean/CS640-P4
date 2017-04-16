@@ -34,6 +34,8 @@ import net.floodlightcontroller.devicemanager.IDeviceService;
 import net.floodlightcontroller.linkdiscovery.ILinkDiscoveryListener;
 import net.floodlightcontroller.linkdiscovery.ILinkDiscoveryService;
 import net.floodlightcontroller.routing.Link;
+import net.floodlightcontroller.util.MACAddress;
+
 
 public class L3Routing implements IFloodlightModule, IOFSwitchListener, 
 		ILinkDiscoveryListener, IDeviceListener
@@ -311,7 +313,7 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 				// what's the distance to the sw right next to us?
 				// if the current distance is bigger than ours + 1, then
 				// we have a better path. 
-				if (currDistToOtherSwitch > distToSwitch + 1)
+				if (currDistToOtherSwitch < 0 || currDistToOtherSwitch > distToSwitch + 1)
 				{
 					bestRouteDistMap.put(other_sw, distToSwitch + 1);
 					bestRoutePorts.put(other_sw, (is_src) ? link.getDstPort() : link.getSrcPort()); 
@@ -321,7 +323,12 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 				swToProcess.add(other_sw);
 			}
 		}
-		
+        System.out.println("Bellman Ford Algorithm");
+        for (Map.Entry<Long, Integer> e : bestRouteDistMap.entrySet())
+        {
+            System.out.println("ID: " + e.getKey() + " | V: " + e.getValue());
+        }
+        		
 		// in order to install the routes, we need to know the map between
 		// DPID and ports. So we return this map.
 		return bestRoutePorts;
@@ -353,23 +360,44 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 			return;
 		
 		Map<Long, Integer> bestRoute = this.runBellmanFordAlgorithm(host.getSwitch());
+        System.out.println("Install rules: ");
+        for (Map.Entry<Long, Integer> e : bestRoute.entrySet())
+        {
+            System.out.println("ID: " + e.getKey() + " | V: " + e.getValue());
+        }
+
 		for (long sw_id : bestRoute.keySet())
 		{
+            if (this.getSwitches().get(sw_id) == null)
+            {
+                System.out.println("null switch? + " + sw_id);
+                continue;
+            }
+
 			OFAction action = new OFActionOutput(bestRoute.get(sw_id));
 			OFInstruction instr = new OFInstructionApplyActions(Arrays.asList(action));
 
-			
-			boolean success = SwitchCommands.installRule(
+			SwitchCommands.installRule(
 				this.getSwitches().get(sw_id), 
 				table,
 				SwitchCommands.DEFAULT_PRIORITY,
 				this.getMatchCriterion(host),
 				Arrays.asList(instr)
 			);
-			
-			System.out.println(success + " installing rule on switch: " 
-					+ this.getSwitches().get(sw_id) + " | ID: " + sw_id);
 		}
+
+        if (host.getPort() == null)
+        {
+            System.out.println("null host port???" + host.getName());
+            return;
+        }
+
+        OFAction action = new OFActionOutput(host.getPort());
+        OFInstruction instruction = new OFInstructionApplyActions(Arrays.asList(action));
+
+        SwitchCommands.installRule(host.getSwitch(), table, 
+                SwitchCommands.DEFAULT_PRIORITY, this.getMatchCriterion(host), 
+                Arrays.asList(instruction));
 	}
 	
 	private void removeRulesFromHost(Host host)
@@ -383,6 +411,7 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 		OFMatch match = new OFMatch();
 		match.setDataLayerType(OFMatch.ETH_TYPE_IPV4);
 		match.setNetworkDestination(host.getIPv4Address());
+        //match.setDataLayerDestination(MACAddress.valueOf(host.getMACAddress()).toBytes());
 		return match;
 	}
 	
