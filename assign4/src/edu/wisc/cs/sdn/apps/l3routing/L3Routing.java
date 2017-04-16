@@ -252,7 +252,11 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 		
 		/*********************************************************************/
 		/* TODO: Update routing: change routing rules for all hosts          */
-		
+        for (Host host : this.getHosts())
+		{
+			this.removeRulesFromHost(host);
+			this.installRulesToHost(host);
+		}
 		/*********************************************************************/
 	}
 
@@ -264,9 +268,9 @@ public class L3Routing implements IFloodlightModule, IOFSwitchListener,
 	 */
 	private Map<Long, Integer> runBellmanFordAlgorithm(IOFSwitch start)
 	{
-		Map<Long, Integer> bestRouteDistMap = new ConcurrentHashMap<>();
-		Map<Long, Integer> bestRoutePorts = new ConcurrentHashMap<>();
-		Queue<Long> swToProcess = new LinkedBlockingQueue<>();
+		Map<Long, Integer> bestRouteDistMap = new ConcurrentHashMap<Long, Integer>();
+		Map<Long, Integer> bestRoutePorts = new ConcurrentHashMap<Long, Integer>();
+		Queue<Long> swToProcess = new LinkedBlockingQueue<Long>();
 		
 		// init graph to infinity (-1) in this case
 		for (Map.Entry<Long, IOFSwitch> pair : this.getSwitches().entrySet())
