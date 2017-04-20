@@ -1,5 +1,6 @@
 package edu.wisc.cs.sdn.apps.loadbalancer;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -9,17 +10,16 @@ import java.util.Map;
 import org.openflow.protocol.OFMessage;
 import org.openflow.protocol.OFPacketIn;
 import org.openflow.protocol.OFType;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import edu.wisc.cs.sdn.apps.util.ArpServer;
-
+import edu.wisc.cs.sdn.apps.util.SwitchCommands;
 import net.floodlightcontroller.core.FloodlightContext;
 import net.floodlightcontroller.core.IFloodlightProviderService;
 import net.floodlightcontroller.core.IOFMessageListener;
-import net.floodlightcontroller.core.IOFSwitch.PortChangeType;
 import net.floodlightcontroller.core.IOFSwitch;
+import net.floodlightcontroller.core.IOFSwitch.PortChangeType;
 import net.floodlightcontroller.core.IOFSwitchListener;
 import net.floodlightcontroller.core.ImmutablePort;
 import net.floodlightcontroller.core.module.FloodlightModuleContext;
@@ -29,7 +29,10 @@ import net.floodlightcontroller.core.module.IFloodlightService;
 import net.floodlightcontroller.devicemanager.IDevice;
 import net.floodlightcontroller.devicemanager.IDeviceService;
 import net.floodlightcontroller.devicemanager.internal.DeviceManagerImpl;
+import net.floodlightcontroller.packet.ARP;
 import net.floodlightcontroller.packet.Ethernet;
+import net.floodlightcontroller.packet.IPv4;
+import net.floodlightcontroller.packet.TCP;
 import net.floodlightcontroller.util.MACAddress;
 
 public class LoadBalancer implements IFloodlightModule, IOFSwitchListener,
@@ -130,6 +133,9 @@ public class LoadBalancer implements IFloodlightModule, IOFSwitchListener,
 		/*       (2) ARP packets to the controller, and                      */
 		/*       (3) all other packets to the next rule table in the switch  */
 		
+		
+		
+		
 		/*********************************************************************/
 	}
 	
@@ -160,11 +166,95 @@ public class LoadBalancer implements IFloodlightModule, IOFSwitchListener,
 		/*       connection-specific rules to rewrite IP and MAC addresses;  */
 		/*       ignore all other packets                                    */
 		
-		/*********************************************************************/
+		switch (ethPkt.getEtherType())
+		{
+			case Ethernet.TYPE_ARP:
+				ARP arp = (ARP) ethPkt.getPayload();
+				
+				int targetIp = ByteBuffer.wrap(arp.getTargetProtocolAddress()).getInt();
+				
+				// forward using L3Routing if not ARP request or not inbound to virtual ip
+				if (arp.getOpCode() != ARP.OP_REQUEST || !instances.containsKey(targetIp))
+				{
+					this.forwardUsingL3RoutingTable(ethPkt);
+					return Command.STOP;
+				}
+				
+				LoadBalancerInstance instance = instances.get(targetIp);
+				
+				// construct ARP reply
+		        Ethernet ethArpReply = new Ethernet();
+		        ethArpReply.setEtherType(Ethernet.TYPE_ARP);
+		        ethArpReply.setSourceMACAddress(instance.getVirtualMAC());
+		        ethArpReply.setDestinationMACAddress(ethPkt.getSourceMACAddress());
+		        
+		        ARP arpReply = new ARP();
+		        arpReply.setHardwareType(ARP.HW_TYPE_ETHERNET);
+		        arpReply.setProtocolType(ARP.PROTO_TYPE_IP);
+		        arpReply.setProtocolAddressLength((byte) 4);
+		        arpReply.setOpCode(ARP.OP_REPLY);
+		        arpReply.setHardwareAddressLength((byte) Ethernet.DATALAYER_ADDRESS_LENGTH);
+		        arpReply.setSenderHardwareAddress(instance.getVirtualMAC());
+		        arpReply.setSenderProtocolAddress(targetIp);
+		        arpReply.setTargetHardwareAddress(arp.getSenderHardwareAddress());
+		        arpReply.setTargetProtocolAddress(arp.getSenderProtocolAddress());
+		        ethArpReply.setPayload(arpReply);
 
-		
-		// We don't care about other packets
-		return Command.CONTINUE;
+		        int outPort = -1;
+		        for (ImmutablePort p : sw.getPorts())
+		        {
+		        	MACAddress pHwAddr = MACAddress.valueOf(p.getHardwareAddress());
+		        	MACAddress instVirtMac = MACAddress.valueOf(instance.getVirtualMAC());
+		        	if (pHwAddr.equals(instVirtMac))
+		        		outPort = p.getPortNumber();
+		        }
+		        
+		        if (outPort < 0)
+		        {
+		        	System.out.println("ARP Request: Failed to find out port!");
+		        }
+		        else
+		        {
+		        	SwitchCommands.sendPacket(sw, (short)outPort, ethArpReply);
+		        }
+				return Command.STOP;
+				
+			case Ethernet.TYPE_IPv4:
+				IPv4 ipv4 = (IPv4) ethPkt.getPayload();
+				if (ipv4.getProtocol() != IPv4.PROTOCOL_TCP)
+					return Command.CONTINUE;
+				
+				// is the pkt inbound to an virtual ip?
+				if (!instances.containsKey(ipv4.getDestinationAddress()))
+				{
+					// if not, forward using L3Routing
+					this.forwardUsingL3RoutingTable(ethPkt);
+					return Command.STOP;
+				}
+				
+				// only handle TCP SYN
+				TCP tcpPkt = (TCP) ipv4.getPayload();
+				if (tcpPkt.getFlags() != TCP_FLAG_SYN)
+				{
+					// not a syn request, forward using L3Routing
+					this.forwardUsingL3RoutingTable(ethPkt);
+					return Command.STOP;
+				}
+				
+				// TODO: select a host and install conn. specific rules
+				
+				return Command.STOP;
+				
+			default:
+				// other packet types are ignored
+				return Command.CONTINUE;
+		}
+		/*********************************************************************/
+	}
+	
+	private void forwardUsingL3RoutingTable(Ethernet ethPkt)
+	{
+		// TODO: do this somehow
 	}
 	
 	/**

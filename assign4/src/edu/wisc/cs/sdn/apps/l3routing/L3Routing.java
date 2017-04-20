@@ -34,7 +34,6 @@ import net.floodlightcontroller.devicemanager.IDeviceService;
 import net.floodlightcontroller.linkdiscovery.ILinkDiscoveryListener;
 import net.floodlightcontroller.linkdiscovery.ILinkDiscoveryService;
 import net.floodlightcontroller.routing.Link;
-import net.floodlightcontroller.util.MACAddress;
 
 
 public class L3Routing implements IFloodlightModule, IOFSwitchListener, 
