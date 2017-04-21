@@ -2,17 +2,29 @@ package edu.wisc.cs.sdn.apps.loadbalancer;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 
+import org.openflow.protocol.OFMatch;
 import org.openflow.protocol.OFMessage;
+import org.openflow.protocol.OFOXMFieldType;
 import org.openflow.protocol.OFPacketIn;
+import org.openflow.protocol.OFPort;
 import org.openflow.protocol.OFType;
+import org.openflow.protocol.action.OFAction;
+import org.openflow.protocol.action.OFActionOutput;
+import org.openflow.protocol.action.OFActionSetField;
+import org.openflow.protocol.instruction.OFInstruction;
+import org.openflow.protocol.instruction.OFInstructionApplyActions;
+import org.openflow.protocol.instruction.OFInstructionGotoTable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import edu.wisc.cs.sdn.apps.l3routing.L3Routing;
 import edu.wisc.cs.sdn.apps.util.ArpServer;
 import edu.wisc.cs.sdn.apps.util.SwitchCommands;
 import net.floodlightcontroller.core.FloodlightContext;
@@ -133,9 +145,34 @@ public class LoadBalancer implements IFloodlightModule, IOFSwitchListener,
 		/*       (2) ARP packets to the controller, and                      */
 		/*       (3) all other packets to the next rule table in the switch  */
 		
+		for (Integer virtual_ip : instances.keySet())
+		{
+			// install IP rules
+			OFMatch ipMatch = new OFMatch();
+			ipMatch.setDataLayerType(OFMatch.ETH_TYPE_IPV4);
+			ipMatch.setNetworkDestination(virtual_ip);
+			ipMatch.setNetworkProtocol(OFMatch.IP_PROTO_TCP);
+			
+			OFAction ipAction = new OFActionOutput(OFPort.OFPP_CONTROLLER);
+			OFInstruction ipInstr = new OFInstructionApplyActions(Arrays.asList(ipAction));
+			SwitchCommands.installRule(sw, table, (short) 1, ipMatch, Arrays.asList(ipInstr)); 
+			
+			// install ARP rules
+			OFMatch arpMatch = new OFMatch();
+			arpMatch.setDataLayerType(OFMatch.ETH_TYPE_ARP);
+			arpMatch.setNetworkDestination(virtual_ip);
+			
+			OFAction arpAction = new OFActionOutput(OFPort.OFPP_CONTROLLER);
+			OFInstruction arpInstr = new OFInstructionApplyActions().setActions(Arrays.asList(arpAction));
+			SwitchCommands.installRule(sw, table, (short) 1, arpMatch, Arrays.asList(arpInstr));
+			
+			// install L3Routing rule
+			OFInstruction l3RoutingAction = new OFInstructionGotoTable(L3Routing.table);
+			SwitchCommands.installRule(sw, table, (short) 1, new OFMatch(), Arrays.asList(l3RoutingAction));
+		}
 		
-		
-		
+		OFInstruction l3RoutingAction = new OFInstructionGotoTable(L3Routing.table);
+		SwitchCommands.installRule(sw, table, (short) 0, new OFMatch(), Arrays.asList(l3RoutingAction));
 		/*********************************************************************/
 	}
 	
@@ -169,6 +206,7 @@ public class LoadBalancer implements IFloodlightModule, IOFSwitchListener,
 		switch (ethPkt.getEtherType())
 		{
 			case Ethernet.TYPE_ARP:
+			{
 				ARP arp = (ARP) ethPkt.getPayload();
 				
 				int targetIp = ByteBuffer.wrap(arp.getTargetProtocolAddress()).getInt();
@@ -176,7 +214,7 @@ public class LoadBalancer implements IFloodlightModule, IOFSwitchListener,
 				// forward using L3Routing if not ARP request or not inbound to virtual ip
 				if (arp.getOpCode() != ARP.OP_REQUEST || !instances.containsKey(targetIp))
 				{
-					this.forwardUsingL3RoutingTable(ethPkt);
+					System.out.println("Detected non ARP request or target ip was not VIP. Dropping");
 					return Command.STOP;
 				}
 				
@@ -200,26 +238,13 @@ public class LoadBalancer implements IFloodlightModule, IOFSwitchListener,
 		        arpReply.setTargetProtocolAddress(arp.getSenderProtocolAddress());
 		        ethArpReply.setPayload(arpReply);
 
-		        int outPort = -1;
-		        for (ImmutablePort p : sw.getPorts())
-		        {
-		        	MACAddress pHwAddr = MACAddress.valueOf(p.getHardwareAddress());
-		        	MACAddress instVirtMac = MACAddress.valueOf(instance.getVirtualMAC());
-		        	if (pHwAddr.equals(instVirtMac))
-		        		outPort = p.getPortNumber();
-		        }
-		        
-		        if (outPort < 0)
-		        {
-		        	System.out.println("ARP Request: Failed to find out port!");
-		        }
-		        else
-		        {
-		        	SwitchCommands.sendPacket(sw, (short)outPort, ethArpReply);
-		        }
+	        	int debugip = IPv4.toIPv4Address(arpReply.getTargetProtocolAddress());
+		        System.out.println("Sent ARP reply on port " + pktIn.getInPort() + " to " + IPv4.fromIPv4Address(debugip));
+	        	SwitchCommands.sendPacket(sw, (short)pktIn.getInPort(), ethArpReply);
 				return Command.STOP;
-				
+			}	
 			case Ethernet.TYPE_IPv4:
+			{
 				IPv4 ipv4 = (IPv4) ethPkt.getPayload();
 				if (ipv4.getProtocol() != IPv4.PROTOCOL_TCP)
 					return Command.CONTINUE;
@@ -227,8 +252,7 @@ public class LoadBalancer implements IFloodlightModule, IOFSwitchListener,
 				// is the pkt inbound to an virtual ip?
 				if (!instances.containsKey(ipv4.getDestinationAddress()))
 				{
-					// if not, forward using L3Routing
-					this.forwardUsingL3RoutingTable(ethPkt);
+					System.out.println("Packet not inbound to VIP, dropping!");
 					return Command.STOP;
 				}
 				
@@ -237,24 +261,64 @@ public class LoadBalancer implements IFloodlightModule, IOFSwitchListener,
 				if (tcpPkt.getFlags() != TCP_FLAG_SYN)
 				{
 					// not a syn request, forward using L3Routing
-					this.forwardUsingL3RoutingTable(ethPkt);
+					//this.forwardUsingL3RoutingTable(ethPkt);
 					return Command.STOP;
 				}
 				
-				// TODO: select a host and install conn. specific rules
+				LoadBalancerInstance instance = instances.get(ipv4.getDestinationAddress());
+				int nextHostIp = instance.getNextHostIP();
+				System.out.println("Requested IP: " + ipv4.getDestinationAddress() + " | Given: " + nextHostIp);
 				
+				// install rule to rewrite packets to virtual ip to chosen host
+				// this match object is the search criteria to nab any packets
+				// from the sender to the virtual ip
+				OFMatch chosenHostMatch = new OFMatch();
+				chosenHostMatch.setDataLayerType(OFMatch.ETH_TYPE_IPV4);
+				chosenHostMatch.setNetworkSource(ipv4.getSourceAddress());
+				chosenHostMatch.setNetworkDestination(ipv4.getDestinationAddress());
+				chosenHostMatch.setNetworkProtocol(OFMatch.IP_PROTO_TCP);
+				chosenHostMatch.setTransportSource(tcpPkt.getSourcePort());
+				chosenHostMatch.setTransportDestination(tcpPkt.getDestinationPort());
+				
+				OFInstructionApplyActions applyActions = new OFInstructionApplyActions();
+				applyActions.setActions(
+					Arrays.asList(
+						(OFAction) new OFActionSetField(OFOXMFieldType.ETH_DST, this.getHostMACAddress(nextHostIp)),
+						(OFAction) new OFActionSetField(OFOXMFieldType.IPV4_DST, nextHostIp)
+					)
+				);
+				
+				OFInstruction l3redirect = new OFInstructionGotoTable(L3Routing.table);				
+				
+				List<OFInstruction> instructions = Arrays.asList(applyActions, l3redirect);
+				SwitchCommands.installRule(sw, table, (short) 3, chosenHostMatch, instructions, SwitchCommands.NO_TIMEOUT, IDLE_TIMEOUT);
+				
+				// install rule to catch packets going the other way
+				OFMatch outboundMatch = new OFMatch();
+				outboundMatch.setDataLayerType(OFMatch.ETH_TYPE_IPV4);
+				outboundMatch.setNetworkSource(nextHostIp);
+				outboundMatch.setNetworkDestination(ipv4.getSourceAddress());
+				outboundMatch.setNetworkProtocol(OFMatch.IP_PROTO_TCP);
+				outboundMatch.setTransportSource(tcpPkt.getDestinationPort());
+				outboundMatch.setTransportDestination(tcpPkt.getSourcePort());
+				
+				OFInstructionApplyActions outboundApplyActions = new OFInstructionApplyActions();
+				outboundApplyActions.setActions(
+					Arrays.asList(
+						(OFAction) new OFActionSetField(OFOXMFieldType.ETH_DST, ethPkt.getDestinationMACAddress()),
+						(OFAction) new OFActionSetField(OFOXMFieldType.IPV4_SRC, ipv4.getDestinationAddress())
+					)
+				);
+
+				List<OFInstruction> outboundInstructions = Arrays.asList(outboundApplyActions, l3redirect);
+				SwitchCommands.installRule(sw, table, (short) 3, outboundMatch, outboundInstructions, SwitchCommands.NO_TIMEOUT, IDLE_TIMEOUT);
 				return Command.STOP;
-				
+			}	
 			default:
 				// other packet types are ignored
 				return Command.CONTINUE;
 		}
 		/*********************************************************************/
-	}
-	
-	private void forwardUsingL3RoutingTable(Ethernet ethPkt)
-	{
-		// TODO: do this somehow
 	}
 	
 	/**
